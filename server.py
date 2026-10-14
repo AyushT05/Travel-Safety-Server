@@ -9,6 +9,7 @@ locations = {}  # name -> {lat, lon, accuracy, timestamp}
 # Supabase config from environment
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+GEOAPIFY_API_KEY = os.environ.get("GEOAPIFY_API_KEY", "")
 
 # ============================================================================
 # Safety Assessment Helpers
@@ -41,60 +42,85 @@ def query_overpass(query_str, timeout=30):
         return None
 
 def assess_emergency_access(lat, lon):
-    """Check distances to nearest emergency services"""
-    query = f"""
-    [out:json][timeout:25];
-    (
-      node["amenity"="police"](around:20000,{lat},{lon});
-      node["amenity"="hospital"](around:20000,{lat},{lon});
-      node["amenity"="fire_station"](around:20000,{lat},{lon});
-    );
-    out body;
-    """
+    """Check distances to nearest emergency services using Geoapify API"""
+    if not GEOAPIFY_API_KEY:
+        print("Geoapify API key not configured, defaulting to moderate risk")
+        return None, None, None, 0.5
 
-    result = query_overpass(query)
-    if not result or 'elements' not in result:
-        return None, None, None, 0.5  # Default moderate risk when data unavailable
+    try:
+        # Geoapify categories for emergency services
+        categories = "service.police,healthcare.hospital,service.fire_station"
+        params = {
+            "categories": categories,
+            "filter": f"circle:{lon},{lat},20000",
+            "bias": f"proximity:{lon},{lat}",
+            "limit": "50",
+            "apiKey": GEOAPIFY_API_KEY
+        }
 
-    police_dist = None
-    hospital_dist = None
-    fire_dist = None
+        url = f"https://api.geoapify.com/v2/places?{parse.urlencode(params)}"
+        req = request.Request(url, headers={"Accept": "application/json", "User-Agent": "MargRakshak-TravelSafety/1.0"})
 
-    for element in result['elements']:
-        amenity = element.get('tags', {}).get('amenity')
-        elem_lat = element.get('lat')
-        elem_lon = element.get('lon')
+        with request.urlopen(req, timeout=15) as response:
+            result = json.loads(response.read())
 
-        if not elem_lat or not elem_lon:
-            continue
+        if not result or 'features' not in result:
+            return None, None, None, 0.5
 
-        dist = haversine_distance(lat, lon, elem_lat, elem_lon)
+        police_dist = None
+        hospital_dist = None
+        fire_dist = None
 
-        if amenity == 'police' and (police_dist is None or dist < police_dist):
-            police_dist = dist
-        elif amenity == 'hospital' and (hospital_dist is None or dist < hospital_dist):
-            hospital_dist = dist
-        elif amenity == 'fire_station' and (fire_dist is None or dist < fire_dist):
-            fire_dist = dist
+        for feature in result['features']:
+            props = feature.get('properties', {})
+            coords = feature.get('geometry', {}).get('coordinates', [])
 
-    # Compute risk score based on worst (farthest) service
-    distances = [d for d in [police_dist, hospital_dist, fire_dist] if d is not None]
-    if not distances:
-        emergency_score = 0.8  # No services found = high risk
-    else:
-        max_dist = max(distances)
-        if max_dist < 2:
-            emergency_score = 0.0
-        elif max_dist < 5:
-            emergency_score = 0.15
-        elif max_dist < 10:
-            emergency_score = 0.35
-        elif max_dist < 20:
-            emergency_score = 0.6
+            if len(coords) < 2:
+                continue
+
+            # GeoJSON is [lon, lat]
+            elem_lon, elem_lat = coords[0], coords[1]
+
+            if not isinstance(elem_lat, (int, float)) or not isinstance(elem_lon, (int, float)):
+                continue
+
+            dist = haversine_distance(lat, lon, elem_lat, elem_lon)
+
+            # Classify by category
+            categories_list = props.get('categories', [])
+
+            if any('police' in cat for cat in categories_list):
+                if police_dist is None or dist < police_dist:
+                    police_dist = dist
+            elif any('hospital' in cat for cat in categories_list):
+                if hospital_dist is None or dist < hospital_dist:
+                    hospital_dist = dist
+            elif any('fire_station' in cat for cat in categories_list):
+                if fire_dist is None or dist < fire_dist:
+                    fire_dist = dist
+
+        # Compute risk score based on worst (farthest) service
+        distances = [d for d in [police_dist, hospital_dist, fire_dist] if d is not None]
+        if not distances:
+            emergency_score = 0.7  # No services found = high risk
         else:
-            emergency_score = 0.9
+            max_dist = max(distances)
+            if max_dist < 2:
+                emergency_score = 0.0
+            elif max_dist < 5:
+                emergency_score = 0.15
+            elif max_dist < 10:
+                emergency_score = 0.35
+            elif max_dist < 20:
+                emergency_score = 0.6
+            else:
+                emergency_score = 0.9
 
-    return police_dist, hospital_dist, fire_dist, emergency_score
+        return police_dist, hospital_dist, fire_dist, emergency_score
+
+    except Exception as e:
+        print(f"Geoapify emergency access error: {e}")
+        return None, None, None, 0.5
 
 def assess_isolation(lat, lon):
     """Check for isolation indicators - roads, buildings, settlements"""
@@ -362,7 +388,7 @@ def write_assessment_to_supabase(assessment):
         )
 
         response = request.urlopen(req, timeout=10)
-        resp_data = response.read().decode()
+        response.read()
         response.close()
 
         print(f"✓ Safety assessment written for user {assessment['user_id']}: {assessment['safety_status']}")
@@ -527,7 +553,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
-    def log_message(self, fmt, *args):
+    def log_message(self, _, *__):
         pass  # suppress default HTTP logs
 
 print(f"Server running on http://0.0.0.0:{PORT}")
