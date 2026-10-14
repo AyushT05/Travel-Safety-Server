@@ -105,7 +105,7 @@ def assess_isolation(lat, lon):
       way["building"](around:300,{lat},{lon});
       node["place"~"village|town|city"](around:3000,{lat},{lon});
     );
-    out count;
+    out body;
     """
 
     result = query_overpass(query)
@@ -115,12 +115,12 @@ def assess_isolation(lat, lon):
     # Count elements found
     count = len(result.get('elements', []))
 
-    if count > 50:
-        return 0.0  # Well connected
-    elif count > 20:
-        return 0.2  # Some infrastructure
+    if count > 30:
+        return 0.0  # Well connected urban/suburban area
+    elif count > 15:
+        return 0.15  # Some infrastructure
     elif count > 5:
-        return 0.5  # Limited infrastructure
+        return 0.4  # Limited infrastructure (rural)
     else:
         return 0.8  # Highly isolated
 
@@ -341,17 +341,16 @@ def compute_safety_assessment(lat, lon, user_id, travel_card_id, prev_locations)
     }
 
 def write_assessment_to_supabase(assessment):
-    """Write safety assessment to Supabase (upsert)"""
+    """Write safety assessment to Supabase (upsert on user_id)"""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         print("Supabase credentials not configured")
         return False
 
     try:
-        # Upsert into safety_assessments
         payload = json.dumps(assessment).encode()
 
         req = request.Request(
-            f"{SUPABASE_URL}/rest/v1/safety_assessments",
+            f"{SUPABASE_URL}/rest/v1/safety_assessments?on_conflict=user_id",
             data=payload,
             method='POST',
             headers={
@@ -362,11 +361,23 @@ def write_assessment_to_supabase(assessment):
             }
         )
 
-        with request.urlopen(req, timeout=10):
-            print(f"Safety assessment written for user {assessment['user_id']}: {assessment['safety_status']}")
-            return True
+        response = request.urlopen(req, timeout=10)
+        resp_data = response.read().decode()
+        response.close()
+
+        print(f"✓ Safety assessment written for user {assessment['user_id']}: {assessment['safety_status']}")
+        print(f"  Emergency: Police={assessment.get('nearest_police_km')}km Hospital={assessment.get('nearest_hospital_km')}km Fire={assessment.get('nearest_fire_km')}km")
+        print(f"  Risk: {assessment.get('risk_score')} Isolation: {assessment.get('isolation_score')}")
+        return True
+
+    except request.HTTPError as e:
+        error_body = e.read().decode() if hasattr(e, 'read') else str(e)
+        print(f"✗ Supabase HTTP error ({e.code}): {error_body}")
+        return False
     except Exception as e:
-        print(f"Error writing to Supabase: {e}")
+        print(f"✗ Error writing to Supabase: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 # ============================================================================
