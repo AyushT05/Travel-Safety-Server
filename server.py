@@ -44,8 +44,8 @@ def query_overpass(query_str, timeout=30):
 def assess_emergency_access(lat, lon):
     """Check distances to nearest emergency services using Geoapify API"""
     if not GEOAPIFY_API_KEY:
-        print("Geoapify API key not configured, defaulting to moderate risk")
-        return None, None, None, 0.5
+        print("Geoapify API key not configured; emergency access is unknown")
+        return None, None, None, None
 
     try:
         # Geoapify categories for emergency services
@@ -65,7 +65,7 @@ def assess_emergency_access(lat, lon):
             result = json.loads(response.read())
 
         if not result or 'features' not in result:
-            return None, None, None, 0.5
+            return None, None, None, None
 
         police_dist = None
         hospital_dist = None
@@ -120,35 +120,75 @@ def assess_emergency_access(lat, lon):
 
     except Exception as e:
         print(f"Geoapify emergency access error: {e}")
-        return None, None, None, 0.5
+        return None, None, None, None
 
-def assess_isolation(lat, lon):
-    """Check for isolation indicators - roads, buildings, settlements"""
+def assess_isolation(lat, lon, emergency_distances=()):
+    """Estimate isolation from several independent OSM infrastructure signals.
+
+    A missing map response is unknown, not evidence that somebody is isolated.
+    Nearby police or hospital access is also strong contrary evidence.
+    """
     query = f"""
     [out:json][timeout:25];
     (
-      way["highway"~"primary|secondary|tertiary|residential"](around:500,{lat},{lon});
-      way["building"](around:300,{lat},{lon});
-      node["place"~"village|town|city"](around:3000,{lat},{lon});
+      way["highway"~"primary|secondary|tertiary|residential|unclassified|living_street"](around:1500,{lat},{lon});
+      way["building"](around:1000,{lat},{lon});
+      node["shop"](around:1500,{lat},{lon});
+      node["amenity"~"hospital|police|school|bank|fuel|restaurant|marketplace"](around:2000,{lat},{lon});
+      node["place"~"village|town|city|suburb|neighbourhood"](around:5000,{lat},{lon});
     );
     out body;
     """
 
     result = query_overpass(query)
     if not result or 'elements' not in result:
-        return 0.5  # Default moderate isolation score
+        return None, {"available": False}
 
-    # Count elements found
-    count = len(result.get('elements', []))
+    elements = result.get('elements', [])
+    counts = {
+        "roads": sum(1 for e in elements if "highway" in e.get("tags", {})),
+        "buildings": sum(1 for e in elements if "building" in e.get("tags", {})),
+        "amenities": sum(1 for e in elements if "amenity" in e.get("tags", {}) or "shop" in e.get("tags", {})),
+        "settlements": sum(1 for e in elements if "place" in e.get("tags", {})),
+        "available": True,
+    }
+    connected = counts["roads"] >= 20 or counts["buildings"] >= 80 or counts["amenities"] >= 10
+    moderately_connected = counts["roads"] >= 8 or counts["buildings"] >= 25 or counts["amenities"] >= 3 or counts["settlements"] >= 1
+    score = 0.0 if connected else 0.2 if moderately_connected else 0.7
+    known_emergency = [d for d in emergency_distances if d is not None]
+    if known_emergency and min(known_emergency) <= 2:
+        score = min(score, 0.15)
+    return score, counts
 
-    if count > 30:
-        return 0.0  # Well connected urban/suburban area
-    elif count > 15:
-        return 0.15  # Some infrastructure
-    elif count > 5:
-        return 0.4  # Limited infrastructure (rural)
-    else:
-        return 0.8  # Highly isolated
+def assess_weather(lat, lon):
+    """Return conservative weather risk from Open-Meteo; unavailable is neutral."""
+    try:
+        params = parse.urlencode({"latitude": lat, "longitude": lon,
+                                  "current": "weather_code,precipitation,wind_speed_10m"})
+        req = request.Request(f"https://api.open-meteo.com/v1/forecast?{params}",
+                              headers={"User-Agent": "MargRakshak-TravelSafety/1.0"})
+        with request.urlopen(req, timeout=8) as response:
+            current = json.loads(response.read()).get("current", {})
+        code = int(current.get("weather_code", 0) or 0)
+        rain = float(current.get("precipitation", 0) or 0)
+        wind = float(current.get("wind_speed_10m", 0) or 0)
+        if code in (95, 96, 99) or wind >= 55 or rain >= 12: score = 0.8
+        elif code in (65, 75, 80, 81, 82) or wind >= 35 or rain >= 4: score = 0.45
+        elif code in (51, 53, 55, 61, 63) or wind >= 25: score = 0.18
+        else: score = 0.0
+        return score, {"available": True, "weather_code": code, "precipitation_mm": rain, "wind_kmh": wind}
+    except Exception as e:
+        print(f"Weather lookup error: {e}")
+        return None, {"available": False}
+
+def assess_network(network):
+    """Device connectivity is safety context, not a claim about local coverage."""
+    if not isinstance(network, dict): return None, {"available": False}
+    if network.get("is_connected") is False or network.get("is_internet_reachable") is False:
+        return 0.65, {"available": True, "connected": False, "type": network.get("type")}
+    if network.get("is_connected") is True:
+        return 0.0, {"available": True, "connected": True, "type": network.get("type")}
+    return None, {"available": False}
 
 def assess_hazards(lat, lon):
     """Check for official hazard zones"""
@@ -278,14 +318,14 @@ def compute_trajectory_warning(lat, lon, prev_locations, current_risk_score):
 
     return None
 
-def compute_safety_assessment(lat, lon, user_id, travel_card_id, prev_locations):
+def compute_safety_assessment(lat, lon, user_id, travel_card_id, prev_locations, network=None):
     """Main safety assessment computation"""
 
     # 1. Emergency access
     police_km, hospital_km, fire_km, emergency_score = assess_emergency_access(lat, lon)
 
     # 2. Isolation
-    isolation_score = assess_isolation(lat, lon)
+    isolation_score, infrastructure = assess_isolation(lat, lon, (police_km, hospital_km, fire_km))
 
     # 3. Official hazards
     hazard_zones, hazard_score = assess_hazards(lat, lon)
@@ -293,13 +333,15 @@ def compute_safety_assessment(lat, lon, user_id, travel_card_id, prev_locations)
     # 4. User-reported unsafe zones
     unsafe_zones, crime_score = query_unsafe_zones(lat, lon)
 
-    # Composite risk score (weighted average)
-    risk_score = (
-        0.20 * emergency_score +
-        0.30 * isolation_score +
-        0.25 * hazard_score +
-        0.25 * crime_score
-    )
+    weather_score, weather = assess_weather(lat, lon)
+    network_score, network_evidence = assess_network(network)
+
+    # Re-normalize available sources so an API outage cannot make a familiar
+    # place look risky.
+    components = [(0.20, emergency_score), (0.15, isolation_score), (0.30, hazard_score),
+                  (0.20, crime_score), (0.10, weather_score), (0.05, network_score)]
+    available = [(weight, score) for weight, score in components if score is not None]
+    risk_score = sum(weight * score for weight, score in available) / sum(weight for weight, _ in available)
 
     # Determine status
     if risk_score < 0.3:
@@ -321,13 +363,20 @@ def compute_safety_assessment(lat, lon, user_id, travel_card_id, prev_locations)
             'distance_km': max([d for d in [police_km, hospital_km, fire_km] if d is not None], default=None)
         })
 
-    if isolation_score > 0.4:
+    if isolation_score is not None and isolation_score > 0.45:
         severity = 'high' if isolation_score > 0.7 else 'medium'
         risk_factors.append({
             'type': 'isolation',
             'label': 'Isolated area with limited infrastructure',
             'severity': severity
         })
+
+    if weather_score is not None and weather_score >= 0.18:
+        risk_factors.append({'type': 'weather', 'label': 'Severe weather conditions nearby',
+                             'severity': 'high' if weather_score >= 0.7 else 'medium'})
+    if network_score is not None and network_score > 0:
+        risk_factors.append({'type': 'connectivity', 'label': 'Device has no reliable network connection',
+                             'severity': 'medium'})
 
     if hazard_score > 0.5:
         for hz in hazard_zones:
@@ -359,7 +408,10 @@ def compute_safety_assessment(lat, lon, user_id, travel_card_id, prev_locations)
         'nearest_police_km': police_km,
         'nearest_hospital_km': hospital_km,
         'nearest_fire_km': fire_km,
-        'isolation_score': round(isolation_score, 3),
+        'isolation_score': round(isolation_score, 3) if isolation_score is not None else None,
+        'infrastructure_evidence': infrastructure,
+        'weather': weather,
+        'network': network_evidence,
         'hazard_zones': hazard_zones,
         'matched_unsafe_zones': unsafe_zones,
         'heading_warning': heading_warning,
@@ -601,6 +653,7 @@ class Handler(SimpleHTTPRequestHandler):
             user_id = body.get("user_id")
             travel_card_id = body.get("travel_card_id")
             prev_locations = body.get("prev_locations", [])
+            network = body.get("network")
 
             if lat is None or lon is None or not user_id:
                 self.send_response(400)
@@ -611,7 +664,7 @@ class Handler(SimpleHTTPRequestHandler):
 
             try:
                 # Compute safety assessment
-                assessment = compute_safety_assessment(lat, lon, user_id, travel_card_id, prev_locations)
+                assessment = compute_safety_assessment(lat, lon, user_id, travel_card_id, prev_locations, network)
 
                 # Write to Supabase
                 write_success = write_assessment_to_supabase(assessment)
