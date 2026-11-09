@@ -33,6 +33,7 @@ import math
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from datetime import datetime, timedelta, timezone
 from urllib import error as urlerror, parse, request
 
@@ -136,25 +137,39 @@ class OverpassError(Exception):
     pass
 
 
-def overpass(query, timeout=25):
-    """Run a query against several mirrors. A 200 response carrying a 'remark' (runtime error / timeout)
-    is a FAILURE, not an empty result: that was the root cause of false 'isolated' readings."""
+OVERPASS_TIMEOUT_S = float(os.environ.get("OVERPASS_TIMEOUT_S", "9"))
+
+
+def _overpass_one(url, query, timeout):
+    body = parse.urlencode({"data": query}).encode()
+    data = _http_json(url, data=body, timeout=timeout,
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+    remark = str(data.get("remark", "")).lower()
+    if "error" in remark or "timed out" in remark or "out of memory" in remark:
+        raise OverpassError(remark[:120])
+    if "elements" not in data:
+        raise OverpassError("no elements key")
+    return data
+
+
+def overpass(query, timeout=None):
+    """Ask ALL mirrors at once and take the first good answer (was: one after another, up to 25 s each, which is
+    what made the first safety assessment take over a minute). A 200 response carrying a 'remark' (runtime error /
+    timeout) is a FAILURE, not an empty result: that was the root cause of false 'isolated' readings."""
+    timeout = timeout or OVERPASS_TIMEOUT_S
+    pool = ThreadPoolExecutor(max_workers=len(OVERPASS_MIRRORS))
+    futures = [pool.submit(_overpass_one, url, query, timeout) for url in OVERPASS_MIRRORS]
     last = None
-    for url in OVERPASS_MIRRORS:
-        try:
-            body = parse.urlencode({"data": query}).encode()
-            data = _http_json(url, data=body, timeout=timeout,
-                              headers={"Content-Type": "application/x-www-form-urlencoded"})
-            remark = str(data.get("remark", "")).lower()
-            if "error" in remark or "timed out" in remark or "out of memory" in remark:
-                last = OverpassError(remark[:120])
-                continue
-            if "elements" not in data:
-                last = OverpassError("no elements key")
-                continue
-            return data
-        except (urlerror.URLError, urlerror.HTTPError, TimeoutError, ValueError, OSError) as e:
-            last = e
+    try:
+        for fut in as_completed(futures, timeout=timeout + 2):
+            try:
+                return fut.result()
+            except Exception as e:                                     # noqa: BLE001
+                last = e
+    except FuturesTimeout:
+        last = last or TimeoutError("overpass")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     raise OverpassError(str(last))
 
 
@@ -314,6 +329,11 @@ def assess_infrastructure(lat, lon, emergency):
     if geo is not None:
         dens.append(clamp(geo / 40))
     density = max(dens)                                                # either source showing activity = populated
+    if callable(emergency):                      # a Future.result: resolved only now, after the map data is in
+        try:
+            emergency = emergency()
+        except Exception:                        # noqa: BLE001
+            emergency = {}
     near_services = [d for d in (emergency or {}).values() if d is not None]
     served = bool(near_services) and min(near_services) <= 3.0
 
@@ -829,17 +849,51 @@ _last = {}                                                             # user_id
 _last_lock = threading.Lock()
 
 
+def _safe(fn, *args, default=None):
+    try:
+        return fn(*args)
+    except Exception as e:                       # noqa: BLE001  one failing source must never fail the assessment
+        print(f"[assess] {getattr(fn, '__name__', fn)} failed: {type(e).__name__}: {e}")
+        return default
+
+
+ASSESS_BUDGET_S = float(os.environ.get("ASSESS_BUDGET_S", "14"))
+
+
 def compute_assessment(lat, lon, user_id, travel_card_id, prev_locations=None, network=None, speed=None):
-    emergency_f, emergency = assess_emergency_access(lat, lon)
-    infra_f, infra_meta = assess_infrastructure(lat, lon, emergency)
-    terrain_f = assess_terrain(lat, lon)
-    weather_f, wx_meta = assess_weather(lat, lon)
-    aq_f = assess_air_quality(lat, lon)
+    # Every source is independent, so they run together. Total time is now about the slowest single source
+    # (capped by OVERPASS_TIMEOUT_S) instead of the SUM of ten sequential lookups.
+    pool = ThreadPoolExecutor(max_workers=8)
+    f_emerg = pool.submit(assess_emergency_access, lat, lon)
+    f_infra = pool.submit(assess_infrastructure, lat, lon, lambda: f_emerg.result(timeout=ASSESS_BUDGET_S)[1])
+    f_terrain = pool.submit(assess_terrain, lat, lon)
+    f_weather = pool.submit(assess_weather, lat, lon)
+    f_aq = pool.submit(assess_air_quality, lat, lon)
+    f_net = pool.submit(assess_network, lat, lon, network, user_id, travel_card_id)
+    f_haz = pool.submit(assess_hazards, lat, lon)
+    f_rep = pool.submit(assess_reports, lat, lon)
+    f_hist = pool.submit(assess_history, lat, lon)
+    deadline = time.time() + ASSESS_BUDGET_S
+
+    def get(fut, name, default):
+        try:
+            return fut.result(timeout=max(0.1, deadline - time.time()))
+        except Exception as e:                   # noqa: BLE001
+            print(f"[assess] {name} unavailable: {type(e).__name__}: {e}")
+            return default
+
+    unavailable = lambda key, why: factor(key, None, available=False, note=why)       # noqa: E731
+    emergency_f, emergency = get(f_emerg, "emergency", (unavailable("emergency_access", "timed out"), {}))
+    infra_f, infra_meta = get(f_infra, "infrastructure", (unavailable("infrastructure", "timed out"), None))
+    terrain_f = get(f_terrain, "terrain", unavailable("terrain", "timed out"))
+    weather_f, wx_meta = get(f_weather, "weather", (unavailable("weather", "timed out"), None))
+    aq_f = get(f_aq, "air_quality", unavailable("air_quality", "timed out"))
+    net_f = get(f_net, "network", unavailable("network", "timed out"))
+    hazard_f, hazard_zones = get(f_haz, "hazards", (unavailable("hazards", "timed out"), []))
+    reports_f, unsafe = get(f_rep, "reports", (unavailable("community_reports", "timed out"), []))
+    history_f = get(f_hist, "history", unavailable("incident_history", "timed out"))
+    pool.shutdown(wait=False, cancel_futures=True)
     time_f, period = assess_time(wx_meta)
-    net_f = assess_network(lat, lon, network, user_id, travel_card_id)
-    hazard_f, hazard_zones = assess_hazards(lat, lon)
-    reports_f, unsafe = assess_reports(lat, lon)
-    history_f = assess_history(lat, lon)
 
     factors = [hazard_f, weather_f, emergency_f, infra_f, reports_f, history_f, net_f, terrain_f, aq_f, time_f]
     risk, coverage, quality = combine(factors, period, infra_meta, net_f)
